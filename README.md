@@ -3,7 +3,7 @@
 **Version**: `v0.2.4`  
 **Author**: `阿汐`
 
-`astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG 与可视化 WebUI。
+`astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、网页浏览与可视化 WebUI。
 
 ## Update Notes (v0.2.4)
 
@@ -12,6 +12,7 @@
 - 配置 schema 与文档已同步，WebUI 可直接选择该 Provider。
 - 新增联网搜索工具 `grok_web_search`（可在 `web_search` 配置分组中启用并指定专用 provider，不跟随当前会话 provider）。
 - `grok_web_search` 改为直连 provider 的 `api_base/key/model` 发起请求，并支持 `request_mode` 与 `base_url_override` 配置。
+- 新增基于 `agent-browser` 的网页浏览工具组，可在 `browser_tool` 配置分组中启用。
 
 ## Design Philosophy
 
@@ -75,6 +76,17 @@
 - 按角色、时间、群范围过滤
 - 支持 `ignore_group_id=true` 跨群读取
 
+### Browser Tool
+
+- LLM Tools:
+  - `enhance_browser_open`
+  - `enhance_browser_snapshot`
+  - `enhance_browser_action`
+  - `enhance_browser_wait`
+  - `enhance_browser_close`
+- 基于 `agent-browser`，支持真实网页打开、DOM/可访问性快照、点击、填写、等待与读取
+- 默认按 `unified_msg_origin` 隔离浏览器 session，可选自动持久化 cookies/localStorage
+
 ### Memory RAG WebUI
 
 - 独立 HTTP 服务
@@ -89,6 +101,13 @@
 1. 将插件目录放到 `data/plugins/`
 2. 重启 AstrBot
 3. 在插件配置页面启用需要的能力
+
+如果你要启用网页浏览工具，还需要在宿主机额外安装 `agent-browser`：
+
+```bash
+npm install -g agent-browser
+agent-browser install
+```
 
 ## Recommended Builtin Settings
 
@@ -107,6 +126,7 @@
 - `group_history_enhancement`
 - `active_reply`
 - `web_search`
+- `browser_tool`
 - `memory_rag`
 - `memory_rag_webui`
 - `global_settings`
@@ -169,6 +189,20 @@
 | `show_sources` | bool | `false` | 是否在工具结果中输出来源 |
 | `max_sources` | int | `5` | 来源输出上限，`0` 表示不限制 |
 
+### `browser_tool`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enable` | bool | `false` | 启用 `agent-browser` 包装工具 |
+| `command` | string | `"agent-browser"` | CLI 命令；也可写成 `npx agent-browser` |
+| `timeout_sec` | float | `60` | Python 包装层单次命令总超时 |
+| `headed` | bool | `false` | 是否显示真实浏览器窗口 |
+| `persist_session` | bool | `true` | 是否按聊天来源自动保存/恢复 cookies 与 localStorage |
+| `content_boundaries` | bool | `true` | 是否启用输出内容边界，降低 prompt injection 风险 |
+| `max_output_chars` | int | `12000` | 传给 `agent-browser --max-output`；`0` 表示不限制 |
+| `allowed_domains` | string | `""` | 逗号分隔的允许域名模式 |
+| `idle_timeout_ms` | int | `300000` | 浏览器空闲自动关闭时间；`0` 表示不设置 |
+
 ### `memory_rag_webui`
 
 | Key | Type | Default | Description |
@@ -213,13 +247,54 @@
 
 `duration` 支持 `s/m/h/d`。
 
-### Memory RAG Tools
+### Web Search Tool
 
 #### `grok_web_search`
 
 | Param | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `query` | string | Yes | - | 实时联网检索查询文本 |
+
+### Browser Tools
+
+#### `enhance_browser_open`
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `url` | string | Yes | - | 要打开的绝对 URL |
+
+#### `enhance_browser_snapshot`
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `interactive_refs` | bool | No | `true` | 是否返回类似 `@e2` 的交互 ref，建议保持开启 |
+
+#### `enhance_browser_action`
+
+推荐流程：
+1. 先 `enhance_browser_open(url)`
+2. 再 `enhance_browser_snapshot()` 读取 ref
+3. 然后对 ref 执行 `click/fill/type/...`
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `action` | string | Yes | - | `click` / `fill` / `type` / `press` / `get_text` / `get_html` / `get_value` / `get_title` / `get_url` / `scroll` |
+| `target` | string | No | `""` | 选择器或 snapshot ref，例如 `@e2`；`press` 时填按键；`scroll` 时填方向 |
+| `value` | string | No | `""` | `fill/type` 的文本，或 `scroll` 的像素数 |
+
+#### `enhance_browser_wait`
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `mode` | string | No | `"load"` | `load` / `selector` / `text` / `url` / `time` |
+| `target` | string | No | `"networkidle"` | mode 对应的等待目标 |
+| `state` | string | No | `"visible"` | 仅 `selector` 模式使用：`visible` / `hidden` / `attached` / `detached` |
+
+#### `enhance_browser_close`
+
+无参数。关闭当前聊天来源对应的浏览器 session。
+
+### Memory RAG Tools
 
 #### `enhance_use_image`
 

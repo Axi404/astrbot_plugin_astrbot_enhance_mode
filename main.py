@@ -3,8 +3,10 @@ import base64
 import datetime
 import json
 import mimetypes
+import os
 import random
 import re
+import shlex
 import time
 import traceback
 import uuid
@@ -60,6 +62,7 @@ class Main(star.Star):
         self.ban_store = BanStore(plugin_data_dir / "ban_list.db")
         self.memory_rag_store: MemoryRAGStore | None = None
         self.rag_webui_server: RAGWebUIServer | None = None
+        self._browser_tool_locks: dict[str, asyncio.Lock] = {}
         try:
             self.memory_rag_store = MemoryRAGStore(
                 plugin_data_dir / "memory_rag.db",
@@ -1304,6 +1307,168 @@ class Main(star.Star):
         lines.append("\n[提示: 请基于以上搜索结果直接回答用户，不要输出 Markdown。]")
         return "\n".join(lines)
 
+    @staticmethod
+    def _browser_session_key(origin: str) -> str:
+        raw_origin = str(origin or "").strip() or "default"
+        readable = re.sub(r"[^a-zA-Z0-9_.-]+", "-", raw_origin).strip("-").lower()
+        if len(readable) > 40:
+            readable = readable[:40].rstrip("-")
+        if not readable:
+            readable = "session"
+        suffix = uuid.uuid5(uuid.NAMESPACE_DNS, raw_origin).hex[:12]
+        return f"astrbot-{readable}-{suffix}"
+
+    def _browser_tool_lock(self, session_key: str) -> asyncio.Lock:
+        locks = getattr(self, "_browser_tool_locks", None)
+        if locks is None:
+            locks = {}
+            self._browser_tool_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+        return lock
+
+    def _build_browser_tool_base_args(
+        self, session_key: str, cfg: PluginConfig
+    ) -> list[str]:
+        browser_cfg = cfg.browser_tool
+        command_parts = shlex.split(browser_cfg.command)
+        if not command_parts:
+            command_parts = ["agent-browser"]
+
+        args = command_parts + ["--session", session_key]
+        if browser_cfg.persist_session:
+            args.extend(["--session-name", session_key])
+        if browser_cfg.headed:
+            args.append("--headed")
+        if browser_cfg.content_boundaries:
+            args.append("--content-boundaries")
+        if browser_cfg.max_output_chars > 0:
+            args.extend(["--max-output", str(browser_cfg.max_output_chars)])
+        if browser_cfg.allowed_domains:
+            args.extend(
+                ["--allowed-domains", ",".join(cfg.browser_tool.allowed_domains)]
+            )
+        return args
+
+    async def _run_browser_tool_command(
+        self,
+        event: AstrMessageEvent,
+        command_args: list[str],
+        cfg: PluginConfig,
+    ) -> dict[str, object]:
+        browser_cfg = cfg.browser_tool
+        session_key = self._browser_session_key(event.unified_msg_origin)
+        command_name = command_args[0] if command_args else "unknown"
+        base_args = self._build_browser_tool_base_args(session_key, cfg)
+        env = os.environ.copy()
+        if browser_cfg.idle_timeout_ms > 0:
+            env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(browser_cfg.idle_timeout_ms)
+        env["AGENT_BROWSER_DEFAULT_TIMEOUT"] = str(
+            max(1000, min(int(browser_cfg.timeout_sec * 1000), 30000))
+        )
+
+        start = time.perf_counter()
+        process: asyncio.subprocess.Process | None = None
+        try:
+            async with self._browser_tool_lock(session_key):
+                process = await asyncio.create_subprocess_exec(
+                    *(base_args + ["--json", *command_args]),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=max(browser_cfg.timeout_sec + 5.0, 10.0),
+                )
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "action": command_name,
+                "session": session_key,
+                "error": (
+                    "agent-browser command not found. "
+                    "Install it with `npm install -g agent-browser` and then run "
+                    "`agent-browser install`."
+                ),
+            }
+        except asyncio.TimeoutError:
+            if process is not None:
+                process.kill()
+                await process.communicate()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.warning(
+                "enhance-mode | browser_tool timeout | origin=%s session=%s action=%s elapsed_ms=%.1f",
+                event.unified_msg_origin,
+                session_key,
+                command_name,
+                elapsed_ms,
+            )
+            return {
+                "ok": False,
+                "action": command_name,
+                "session": session_key,
+                "elapsed_ms": round(elapsed_ms, 1),
+                "error": (
+                    "Browser command timed out. "
+                    f"Current timeout={browser_cfg.timeout_sec:.1f}s."
+                ),
+            }
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        parsed_payload: object = stdout
+        cli_success = process.returncode == 0
+        cli_error = ""
+        if stdout:
+            try:
+                parsed_json = json.loads(stdout)
+            except json.JSONDecodeError:
+                parsed_json = None
+            if isinstance(parsed_json, dict):
+                cli_success = bool(parsed_json.get("success", cli_success))
+                cli_error = str(parsed_json.get("error") or "").strip()
+                parsed_payload = parsed_json.get("data", parsed_json)
+
+        result: dict[str, object] = {
+            "ok": cli_success and process.returncode == 0,
+            "action": command_name,
+            "session": session_key,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "data": parsed_payload,
+        }
+        if stderr:
+            result["stderr"] = stderr
+        if not bool(result["ok"]):
+            error = stderr or cli_error or stdout or f"Exit code {process.returncode}"
+            result["error"] = error
+            result["exit_code"] = process.returncode
+            logger.warning(
+                "enhance-mode | browser_tool failed | origin=%s session=%s action=%s elapsed_ms=%.1f error=%s",
+                event.unified_msg_origin,
+                session_key,
+                command_name,
+                elapsed_ms,
+                error[:400],
+            )
+        else:
+            logger.info(
+                "enhance-mode | browser_tool done | origin=%s session=%s action=%s elapsed_ms=%.1f",
+                event.unified_msg_origin,
+                session_key,
+                command_name,
+                elapsed_ms,
+            )
+        return result
+
+    @staticmethod
+    def _format_browser_tool_result(result: dict[str, object]) -> str:
+        return json.dumps(result, ensure_ascii=False)
+
     async def _judge_model_choice(
         self,
         event: AstrMessageEvent,
@@ -1501,14 +1666,28 @@ class Main(star.Star):
     @filter.on_llm_request()
     async def inject_role(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         cfg = self._cfg()
-        if not cfg.group_features.role_display:
+        gf = cfg.group_features
+        if not gf.role_display and not gf.role_prompt_enable:
             return
 
         base_cfg = self.context.get_config(umo=event.unified_msg_origin)
         if not base_cfg.get("identifier"):
             return
 
-        role = "admin" if event.is_admin() else "member"
+        is_admin = event.is_admin()
+        role = "admin" if is_admin else "member"
+
+        if gf.role_prompt_enable:
+            extra_prompt = gf.role_admin_prompt if is_admin else gf.role_member_prompt
+            extra_prompt = extra_prompt.strip()
+            if extra_prompt:
+                if req.system_prompt and not req.system_prompt.endswith("\n"):
+                    req.system_prompt += "\n"
+                req.system_prompt += extra_prompt
+
+        if not gf.role_display:
+            return
+
         role_line = f", Role: {role}"
 
         for part in req.extra_user_content_parts:
@@ -1754,6 +1933,16 @@ class Main(star.Star):
                 "\nWhen real-time facts or uncertain external information are needed, "
                 "you may call `grok_web_search(query)`."
             )
+        if cfg.browser_tool.enable:
+            interaction_instructions += (
+                "\nWhen you need to interact with a real webpage, "
+                "first call `enhance_browser_open(url)`, then `enhance_browser_snapshot()` "
+                "to inspect refs like `@e2`. Use `enhance_browser_action(action, target, value)` "
+                "for actions such as click/fill/type/press/get_text/get_html/get_value/get_title/get_url/scroll, "
+                "`enhance_browser_wait(mode, target, state)` when the page needs time to load, "
+                "and `enhance_browser_close()` when done. "
+                "Prefer the snapshot-ref workflow over guessing CSS selectors."
+            )
 
         if (
             cfg.group_features.react_mode_enable
@@ -1895,6 +2084,191 @@ class Main(star.Star):
 
         result = await self._run_web_search(event, clean_query, cfg)
         return self._format_web_search_tool_result(result, cfg)
+
+    @llm_tool(name="enhance_browser_open")
+    async def enhance_browser_open(self, event: AstrMessageEvent, url: str) -> str:
+        """Open a webpage with agent-browser in the current chat session.
+
+        Args:
+            url(string): Required. Absolute URL, for example `https://example.com`.
+        """
+        cfg = self._cfg()
+        if not cfg.browser_tool.enable:
+            return "Browser tool is disabled in enhance mode config."
+
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            return "Invalid `url`: empty."
+
+        result = await self._run_browser_tool_command(event, ["open", clean_url], cfg)
+        return self._format_browser_tool_result(result)
+
+    @llm_tool(name="enhance_browser_snapshot")
+    async def enhance_browser_snapshot(
+        self, event: AstrMessageEvent, interactive_refs: bool = True
+    ) -> str:
+        """Get the current page snapshot from agent-browser.
+
+        Args:
+            interactive_refs(boolean): Optional. True means include refs like `@e2` for later actions.
+        """
+        cfg = self._cfg()
+        if not cfg.browser_tool.enable:
+            return "Browser tool is disabled in enhance mode config."
+
+        command_args = ["snapshot"]
+        if interactive_refs:
+            command_args.append("-i")
+        result = await self._run_browser_tool_command(event, command_args, cfg)
+        return self._format_browser_tool_result(result)
+
+    @llm_tool(name="enhance_browser_action")
+    async def enhance_browser_action(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        target: str = "",
+        value: str = "",
+    ) -> str:
+        """Run one browser action on the current page.
+
+        Args:
+            action(string): Required. One of `click`, `fill`, `type`, `press`, `get_text`, `get_html`, `get_value`, `get_title`, `get_url`, `scroll`.
+            target(string): Optional. Selector or ref like `@e2`. For `press`, pass the key name. For `scroll`, pass direction: `up/down/left/right`.
+            value(string): Optional. Text for `fill/type`, or pixel count for `scroll`.
+        """
+        cfg = self._cfg()
+        if not cfg.browser_tool.enable:
+            return "Browser tool is disabled in enhance mode config."
+
+        normalized_action = str(action or "").strip().lower()
+        clean_target = str(target or "").strip()
+        clean_value = str(value or "")
+
+        if normalized_action == "click":
+            if not clean_target:
+                return "Invalid `target`: empty for `click`."
+            command_args = ["click", clean_target]
+        elif normalized_action == "fill":
+            if not clean_target:
+                return "Invalid `target`: empty for `fill`."
+            if not clean_value:
+                return "Invalid `value`: empty for `fill`."
+            command_args = ["fill", clean_target, clean_value]
+        elif normalized_action == "type":
+            if not clean_target:
+                return "Invalid `target`: empty for `type`."
+            if not clean_value:
+                return "Invalid `value`: empty for `type`."
+            command_args = ["type", clean_target, clean_value]
+        elif normalized_action == "press":
+            if not clean_target:
+                return "Invalid `target`: empty for `press`."
+            command_args = ["press", clean_target]
+        elif normalized_action == "get_text":
+            command_args = ["get", "text", clean_target or "body"]
+        elif normalized_action == "get_html":
+            command_args = ["get", "html", clean_target or "html"]
+        elif normalized_action == "get_value":
+            if not clean_target:
+                return "Invalid `target`: empty for `get_value`."
+            command_args = ["get", "value", clean_target]
+        elif normalized_action == "get_title":
+            command_args = ["get", "title"]
+        elif normalized_action == "get_url":
+            command_args = ["get", "url"]
+        elif normalized_action == "scroll":
+            direction = clean_target.lower()
+            if direction not in {"up", "down", "left", "right"}:
+                return "Invalid `target` for `scroll`: use `up`, `down`, `left`, or `right`."
+            command_args = ["scroll", direction]
+            if clean_value.strip():
+                command_args.append(clean_value.strip())
+        else:
+            return (
+                "Invalid `action`. Supported values: "
+                "`click`, `fill`, `type`, `press`, `get_text`, `get_html`, "
+                "`get_value`, `get_title`, `get_url`, `scroll`."
+            )
+
+        result = await self._run_browser_tool_command(event, command_args, cfg)
+        return self._format_browser_tool_result(result)
+
+    @llm_tool(name="enhance_browser_wait")
+    async def enhance_browser_wait(
+        self,
+        event: AstrMessageEvent,
+        mode: str = "load",
+        target: str = "networkidle",
+        state: str = "visible",
+    ) -> str:
+        """Wait for page state changes with agent-browser.
+
+        Args:
+            mode(string): Optional. One of `load`, `selector`, `text`, `url`, `time`.
+            target(string): Optional. Load state, selector/ref, text, URL pattern, or milliseconds depending on mode.
+            state(string): Optional. Only for `selector` mode. One of `visible`, `hidden`, `attached`, `detached`.
+        """
+        cfg = self._cfg()
+        if not cfg.browser_tool.enable:
+            return "Browser tool is disabled in enhance mode config."
+
+        normalized_mode = str(mode or "load").strip().lower()
+        clean_target = str(target or "").strip()
+        normalized_state = str(state or "visible").strip().lower() or "visible"
+
+        if normalized_mode == "load":
+            load_state = clean_target or "networkidle"
+            if load_state not in {"load", "domcontentloaded", "networkidle"}:
+                return (
+                    "Invalid `target` for `load` mode. "
+                    "Use `load`, `domcontentloaded`, or `networkidle`."
+                )
+            command_args = ["wait", "--load", load_state]
+        elif normalized_mode == "selector":
+            if not clean_target:
+                return "Invalid `target`: empty for `selector` mode."
+            command_args = ["wait", clean_target]
+            if normalized_state != "visible":
+                if normalized_state not in {"hidden", "attached", "detached"}:
+                    return (
+                        "Invalid `state` for `selector` mode. "
+                        "Use `visible`, `hidden`, `attached`, or `detached`."
+                    )
+                command_args.extend(["--state", normalized_state])
+        elif normalized_mode == "text":
+            if not clean_target:
+                return "Invalid `target`: empty for `text` mode."
+            command_args = ["wait", "--text", clean_target]
+        elif normalized_mode == "url":
+            if not clean_target:
+                return "Invalid `target`: empty for `url` mode."
+            command_args = ["wait", "--url", clean_target]
+        elif normalized_mode == "time":
+            if not clean_target:
+                return "Invalid `target`: empty for `time` mode."
+            try:
+                wait_ms = int(clean_target)
+            except ValueError:
+                return "Invalid `target` for `time` mode: must be an integer millisecond value."
+            if wait_ms < 0:
+                return "Invalid `target` for `time` mode: must be >= 0."
+            command_args = ["wait", str(wait_ms)]
+        else:
+            return "Invalid `mode`. Supported values: `load`, `selector`, `text`, `url`, `time`."
+
+        result = await self._run_browser_tool_command(event, command_args, cfg)
+        return self._format_browser_tool_result(result)
+
+    @llm_tool(name="enhance_browser_close")
+    async def enhance_browser_close(self, event: AstrMessageEvent) -> str:
+        """Close the current chat session browser managed by agent-browser."""
+        cfg = self._cfg()
+        if not cfg.browser_tool.enable:
+            return "Browser tool is disabled in enhance mode config."
+
+        result = await self._run_browser_tool_command(event, ["close"], cfg)
+        return self._format_browser_tool_result(result)
 
     @llm_tool(name="enhance_get_ban_list_status")
     async def get_ban_list_status(

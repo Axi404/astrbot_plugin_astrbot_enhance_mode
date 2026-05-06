@@ -16,6 +16,8 @@ def test_parse_plugin_config_defaults() -> None:
     assert cfg.active_reply_enabled is False
     assert cfg.web_search.request_mode == "auto"
     assert cfg.web_search.base_url_override == ""
+    assert cfg.browser_tool.command == "agent-browser"
+    assert cfg.browser_tool.persist_session is True
 
 
 def test_probability_is_clamped_and_nan_falls_back() -> None:
@@ -76,3 +78,21 @@ def test_web_search_request_mode_and_base_override_are_normalized() -> None:
 
     cfg_invalid = parse_plugin_config({"web_search": {"request_mode": "unknown"}})
     assert cfg_invalid.web_search.request_mode == "auto"
+
+
+def test_browser_tool_config_is_normalized() -> None:
+    cfg = parse_plugin_config(
+        {
+            "browser_tool": {
+                "command": "  npx agent-browser  ",
+                "allowed_domains": "example.com, docs.example.com ",
+                "max_output_chars": -1,
+                "idle_timeout_ms": -5,
+            }
+        }
+    )
+
+    assert cfg.browser_tool.command == "npx agent-browser"
+    assert cfg.browser_tool.allowed_domains == ["example.com", "docs.example.com"]
+    assert cfg.browser_tool.max_output_chars == 0
+    assert cfg.browser_tool.idle_timeout_ms == 0

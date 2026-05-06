@@ -145,6 +145,24 @@
                 "hint": "关闭时，AstrBot 内部判定为 role=admin 的用户不会被封禁工具封禁。",
                 "type": "bool",
                 "default": false
+            },
+            "role_prompt_enable": {
+                "description": "按角色注入提示词",
+                "hint": "启用后，根据用户角色（admin/member）将下方对应的句子追加到 system_prompt。需开启 AstrBot 内置用户识别。",
+                "type": "bool",
+                "default": false
+            },
+            "role_admin_prompt": {
+                "description": "管理员注入提示词",
+                "hint": "当用户角色为 admin 时追加到 system_prompt 的内容。留空表示不注入。",
+                "type": "string",
+                "default": ""
+            },
+            "role_member_prompt": {
+                "description": "普通成员注入提示词",
+                "hint": "当用户角色非 admin 时追加到 system_prompt 的内容。留空表示不注入。",
+                "type": "string",
+                "default": ""
             }
         }
     },
@@ -201,6 +219,67 @@
                 "hint": "`show_sources=true` 时生效。0 表示不限制。",
                 "type": "int",
                 "default": 5
+            }
+        }
+    },
+    "browser_tool": {
+        "description": "网页浏览工具",
+        "hint": "为模型提供基于 `agent-browser` 的真实网页交互工具。需要先在宿主机安装 `agent-browser` 并执行一次 `agent-browser install`。",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用",
+                "hint": "开启后注册并允许调用 `enhance_browser_open / snapshot / action / wait / close`。",
+                "type": "bool",
+                "default": false
+            },
+            "command": {
+                "description": "CLI 命令",
+                "hint": "默认 `agent-browser`。也可以填写 `npx agent-browser` 等可执行命令。",
+                "type": "string",
+                "default": "agent-browser"
+            },
+            "timeout_sec": {
+                "description": "执行超时(秒)",
+                "hint": "Python 包装层的单次命令总超时。",
+                "type": "float",
+                "default": 60
+            },
+            "headed": {
+                "description": "显示浏览器窗口",
+                "hint": "开启后使用 headed 模式，便于本机调试；默认无头模式。",
+                "type": "bool",
+                "default": false
+            },
+            "persist_session": {
+                "description": "持久化会话",
+                "hint": "开启后为每个聊天来源启用 `--session-name`，自动保存和恢复 cookies/localStorage。",
+                "type": "bool",
+                "default": true
+            },
+            "content_boundaries": {
+                "description": "内容边界保护",
+                "hint": "开启后追加 `--content-boundaries`，降低页面文本对模型的提示注入风险。",
+                "type": "bool",
+                "default": true
+            },
+            "max_output_chars": {
+                "description": "最大输出字符数",
+                "hint": "传给 `agent-browser --max-output`。0 表示不限制。",
+                "type": "int",
+                "default": 12000
+            },
+            "allowed_domains": {
+                "description": "允许域名",
+                "hint": "逗号分隔域名模式，传给 `--allowed-domains`。留空表示不限制。",
+                "type": "string",
+                "default": ""
+            },
+            "idle_timeout_ms": {
+                "description": "空闲关闭毫秒数",
+                "hint": "设置 `AGENT_BROWSER_IDLE_TIMEOUT_MS`，浏览器长时间空闲后自动关闭。0 表示不设置。",
+                "type": "int",
+                "default": 300000
             }
         }
     },

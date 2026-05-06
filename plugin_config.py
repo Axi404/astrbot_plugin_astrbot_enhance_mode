@@ -104,6 +104,9 @@ class GroupFeatureEnhancementConfig:
     ban_control_enable: bool = True
     ban_max_duration_sec: int = 2592000
     ban_allow_admin: bool = False
+    role_prompt_enable: bool = False
+    role_admin_prompt: str = ""
+    role_member_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,19 @@ class WebSearchConfig:
 
 
 @dataclass(frozen=True)
+class BrowserToolConfig:
+    enable: bool = False
+    command: str = "agent-browser"
+    timeout_sec: float = 60.0
+    headed: bool = False
+    persist_session: bool = True
+    content_boundaries: bool = True
+    max_output_chars: int = 12000
+    allowed_domains: list[str] = field(default_factory=list)
+    idle_timeout_ms: int = 300000
+
+
+@dataclass(frozen=True)
 class MemoryRAGConfig:
     enable: bool = True
     embedding_provider_id: str = ""
@@ -163,6 +179,7 @@ class PluginConfig:
     )
     global_settings: GlobalSettingsConfig = field(default_factory=GlobalSettingsConfig)
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
+    browser_tool: BrowserToolConfig = field(default_factory=BrowserToolConfig)
     memory_rag: MemoryRAGConfig = field(default_factory=MemoryRAGConfig)
     memory_rag_webui: MemoryRAGWebUIConfig = field(default_factory=MemoryRAGWebUIConfig)
 
@@ -188,6 +205,11 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             1, _to_int(group_features_raw.get("ban_max_duration_sec"), 2592000)
         ),
         ban_allow_admin=_to_bool(group_features_raw.get("ban_allow_admin"), False),
+        role_prompt_enable=_to_bool(
+            group_features_raw.get("role_prompt_enable"), False
+        ),
+        role_admin_prompt=str(group_features_raw.get("role_admin_prompt") or ""),
+        role_member_prompt=str(group_features_raw.get("role_member_prompt") or ""),
     )
 
     group_history_raw = raw.get("group_history_enhancement", {})
@@ -264,6 +286,24 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         max_sources=max(0, _to_int(web_search_raw.get("max_sources"), 5)),
     )
 
+    browser_tool_raw = raw.get("browser_tool", {})
+    browser_tool = BrowserToolConfig(
+        enable=_to_bool(browser_tool_raw.get("enable"), False),
+        command=str(browser_tool_raw.get("command") or "agent-browser").strip()
+        or "agent-browser",
+        timeout_sec=_to_pos_float(browser_tool_raw.get("timeout_sec"), 60.0),
+        headed=_to_bool(browser_tool_raw.get("headed"), False),
+        persist_session=_to_bool(browser_tool_raw.get("persist_session"), True),
+        content_boundaries=_to_bool(browser_tool_raw.get("content_boundaries"), True),
+        max_output_chars=max(
+            0, _to_int(browser_tool_raw.get("max_output_chars"), 12000)
+        ),
+        allowed_domains=_parse_whitelist(browser_tool_raw.get("allowed_domains", "")),
+        idle_timeout_ms=max(
+            0, _to_int(browser_tool_raw.get("idle_timeout_ms"), 300000)
+        ),
+    )
+
     memory_rag_raw = raw.get("memory_rag", {})
     memory_rag = MemoryRAGConfig(
         enable=_to_bool(memory_rag_raw.get("enable"), True),
@@ -292,6 +332,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         group_features=group_features,
         global_settings=global_settings,
         web_search=web_search,
+        browser_tool=browser_tool,
         memory_rag=memory_rag,
         memory_rag_webui=memory_rag_webui,
     )
