@@ -102,6 +102,24 @@
                 "hint": "英文逗号分隔的 unified_msg_origin 或群 ID。留空表示所有群可触发。",
                 "type": "string",
                 "default": ""
+            },
+            "enable_time_trigger": {
+                "description": "启用时间触发",
+                "hint": "从第一条消息入栈开始计时，达到设定时间后触发主动回复判定。",
+                "type": "bool",
+                "default": false
+            },
+            "time_trigger_min_sec": {
+                "description": "时间触发最小间隔(秒)",
+                "hint": "触发判定的最小时间间隔。建议 60-300。",
+                "type": "float",
+                "default": 120.0
+            },
+            "time_trigger_max_sec": {
+                "description": "时间触发最大间隔(秒)",
+                "hint": "触发判定的最大时间间隔，实际触发时间将在最小与最大值之间随机。",
+                "type": "float",
+                "default": 300.0
             }
         }
     },
